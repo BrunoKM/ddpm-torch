@@ -12,6 +12,8 @@ from tqdm import tqdm
 from functools import partial
 from contextlib import nullcontext
 
+import wandb
+
 
 class DummyScheduler:
     @staticmethod
@@ -167,6 +169,7 @@ class Trainer:
         if self.distributed:
             dist.reduce(loss, dst=0, op=dist.ReduceOp.SUM)  # synchronize losses
             loss.div_(self.world_size)
+        wandb.log({"train.loss": loss.item()}, step=global_steps)
         self.stats.update(x.shape[0], loss=loss.item() * x.shape[0])
 
     def sample_fn(self, sample_size=None, noise=None, diffusion=None, sample_seed=None):
@@ -176,6 +179,7 @@ class Trainer:
             shape = noise.shape
         if diffusion is None:
             diffusion = self.diffusion
+        # Use EMA for sampling from the model:
         with self.ema:
             sample = diffusion.p_sample(
                 denoise_fn=self.model, shape=shape,
@@ -197,13 +201,13 @@ class Trainer:
             self.start_epoch, self.epochs = 0, 1
 
         global_steps = 0
-        for e in range(self.start_epoch, self.epochs):
+        for epoch in tqdm(range(self.start_epoch, self.epochs), desc="Training", disable=not self.is_leader):
             self.stats.reset()
             self.model.train()
             results = dict()
             if isinstance(self.sampler, DistributedSampler):
-                self.sampler.set_epoch(e)
-            with tqdm(self.trainloader, desc=f"{e + 1}/{self.epochs} epochs", disable=not self.is_leader) as t:
+                self.sampler.set_epoch(epoch)
+            with tqdm(self.trainloader, desc=f"{epoch + 1}/{self.epochs} epochs", disable=not self.is_leader) as t:
                 for i, x in enumerate(t):
                     if isinstance(x, (list, tuple)):
                         x = x[0]  # unconditional model -> discard labels
@@ -214,21 +218,25 @@ class Trainer:
                     if self.dry_run and not global_steps % self.num_accum:
                         break
 
-            if not (e + 1) % self.image_intv and self.num_samples and image_dir:
+            if not (epoch + 1) % self.image_intv and self.num_samples and image_dir:
                 self.model.eval()
+                # self.sample_fn uses EMA for sampling
                 x = self.sample_fn(sample_size=self.num_samples, sample_seed=self.sample_seed).cpu()
                 if self.is_leader:
-                    save_image(x, os.path.join(image_dir, f"{e + 1}.jpg"), nrow=nrow)
+                    save_image(x, (samples_file_name := os.path.join(image_dir, f"{epoch + 1}.jpg")), nrow=nrow)
+                    wandb.log({"samples": [wandb.Image(samples_file_name, caption=f"Epoch {epoch + 1}")]}, step=global_steps)
 
-            if not (e + 1) % self.chkpt_intv and chkpt_path:
+            if not (epoch + 1) % self.chkpt_intv and chkpt_path:
                 self.model.eval()
                 if evaluator is not None:
+                    # self.sample_fn uses EMA for sampling
                     eval_results = evaluator.eval(self.sample_fn, is_leader=self.is_leader)
+                    wandb.log(eval_results, step=global_steps)
                 else:
                     eval_results = dict()
                 results.update(eval_results)
                 if self.is_leader:
-                    self.save_checkpoint(chkpt_path, epoch=e + 1, **results)
+                    self.save_checkpoint(chkpt_path, epoch=epoch + 1, **results)
 
             if self.distributed:
                 dist.barrier()  # synchronize all processes here
