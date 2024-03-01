@@ -12,3 +12,6 @@ images
 chkpts
 
 .python-version
+
+wandb/
+
